@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"unsafe"
 )
 
@@ -36,59 +38,155 @@ const (
 	TABLE_MAX_PAGE       = 100
 )
 
+var row_ *row = NewRow()
+
+type pager struct {
+	fd         *os.File
+	fileLength uint32
+	pages      []*page
+}
+
+func NewPager(filename string) *pager {
+	file, err := os.OpenFile("filename", os.O_RDWR|os.O_CREATE, syscall.S_IWUSR|syscall.S_IRUSR)
+
+	if err != nil {
+		fmt.Println("Unable to open file \n")
+		os.Exit(1)
+	}
+
+	fs, err := file.Stat()
+	if err != nil {
+		fmt.Println("Unable to fetch stat")
+	}
+
+	p := &pager{}
+	p.fileLength = uint32(fs.Size())
+	p.fd = file
+	p.pages = make([]*page, TABLE_MAX_PAGE)
+
+	return p
+}
+
+func (p *pager) getPage(pageNum uint32) *page {
+	if pageNum > TABLE_MAX_PAGE {
+		fmt.Println("Tried to fetch page number out of bound", TABLE_MAX_PAGE)
+		os.Exit(1)
+	}
+	var numOfPages uint32
+	if p.pages[pageNum] == nil {
+		page := NewPage()
+		numOfPages = p.fileLength / PAGE_SIZE
+
+		if p.fileLength%PAGE_SIZE > 0 {
+			numOfPages++
+		}
+
+		if pageNum <= numOfPages {
+			o, _ := p.fd.Seek(int64(pageNum*PAGE_SIZE), io.SeekStart)
+			log("seeked to offset", o)
+			_, e := p.fd.Read(page.bytes)
+			if e != nil {
+				log("Error while reading bytes from file")
+			}
+			p.pages[pageNum] = page
+		}
+	}
+
+	return p.pages[pageNum]
+}
+
+func (p *pager) flush(pageNum uint32, size uint32) {
+	if p.pages[pageNum] == nil {
+		log("Tried to flush null")
+		os.Exit(1)
+	}
+
+	_, err := p.fd.Seek(int64(pageNum*PAGE_SIZE), io.SeekStart)
+	if err != nil {
+		log("Error seeking file")
+		os.Exit(1)
+	}
+
+	_, err = p.fd.Write(p.pages[pageNum].bytes[:size])
+	if err != nil {
+		log("Error writing")
+		os.Exit(1)
+	}
+}
+
 type page struct {
-	page []byte
+	bytes []byte
 }
 
 func NewPage() *page {
 	p := &page{
-		page: make([]byte, PAGE_SIZE),
+		bytes: make([]byte, PAGE_SIZE),
 	}
 	return p
 }
 
 type table struct {
-	num_rows uint32
-	pages    []*page
+	numOfRows uint32
+	pager     *pager
 }
 
-func NewTable() *table {
-	t := &table{
-		num_rows: 0,
-		pages:    make([]*page, TABLE_MAX_PAGE),
-	}
-
-	for i := 0; i < TABLE_MAX_PAGE; i++ {
-		t.pages[i] = NewPage()
-	}
-
+func openDB(filename string) *table {
+	t := &table{}
+	t.pager = NewPager(filename)
+	t.numOfRows = t.pager.fileLength / row_.size
 	return t
 }
 
-func (t *table) rowSlot(rowNum uint32, r *row) (*page, uint32) {
-	pageNum := rowNum / r.rowsPerPage
-	log("pageNum", pageNum)
-	page := t.pages[pageNum]
-	if page == nil {
-		//Allocate memory only when we try to access page
-		t.pages[pageNum] = NewPage()
-		page = t.pages[pageNum]
+func (t *table) closeDB() {
+
+	numOfFullPages := t.numOfRows / row_.rowsPerPage
+
+	for i := 0; i < int(numOfFullPages); i++ {
+		if t.pager.pages[i] == nil {
+			continue
+		}
+		t.pager.flush(uint32(i), PAGE_SIZE)
+		t.pager.pages[i] = nil
 	}
-	rowOffset := rowNum % r.rowsPerPage
-	byteOffset := rowOffset * r.size
+
+	//there may be a partial page to write to the end of the file
+	//this should not be needed after we switch to B-Tree
+	additionalRows := t.numOfRows % row_.rowsPerPage
+	if additionalRows > 0 {
+		pageNum := numOfFullPages
+		if t.pager.pages[pageNum] != nil {
+			t.pager.flush(pageNum, additionalRows*row_.size)
+			t.pager.pages[pageNum] = nil
+		}
+	}
+
+	err := t.pager.fd.Close()
+	if err != nil {
+		log("Error while closing fd")
+		os.Exit(1)
+	}
+}
+
+func (t *table) rowSlot(rowNum uint32) (*page, uint32) {
+	pageNum := rowNum / row_.rowsPerPage
+	log("pageNum", pageNum)
+	page := t.pager.getPage(rowNum)
+
+	rowOffset := rowNum % row_.rowsPerPage
+	byteOffset := rowOffset * row_.size
 	log("byteOffset", byteOffset)
 	return page, byteOffset
 }
 
 func (t *table) deserializeRow(rowNum uint32) *row {
 	row := NewRow()
-	page, offset := t.rowSlot(rowNum, row)
+	page, offset := t.rowSlot(rowNum)
 	offset = offset + row.idOffset
-	row.id = binary.LittleEndian.Uint32(page.page[offset : offset+row.idSize])
+	row.id = binary.LittleEndian.Uint32(page.bytes[offset : offset+row.idSize])
 	offset = offset + row.usernameOffset
-	row.username = page.page[offset : offset+row.usernameSize]
+	row.username = page.bytes[offset : offset+row.usernameSize]
 	offset = offset + row.emailOffset
-	row.email = page.page[offset : offset+row.emailSize]
+	row.email = page.bytes[offset : offset+row.emailSize]
 
 	return row
 }
@@ -128,17 +226,17 @@ func NewRow() *row {
 }
 
 func (r *row) serialize(t *table) {
-	p, offset := t.rowSlot(t.num_rows, r)
+	p, offset := t.rowSlot(t.numOfRows)
 	offset = offset + r.idOffset
-	binary.LittleEndian.PutUint32(p.page[offset:offset+r.idSize], r.id)
+	binary.LittleEndian.PutUint32(p.bytes[offset:offset+r.idSize], r.id)
 	offset = offset + r.usernameOffset
-	copy(p.page[offset:offset+r.usernameSize], r.username)
+	copy(p.bytes[offset:offset+r.usernameSize], r.username)
 	offset = offset + r.emailOffset
-	copy(p.page[offset:offset+r.emailSize], r.email)
+	copy(p.bytes[offset:offset+r.emailSize], r.email)
 }
 
 func (r *row) print() {
-	fmt.Println(r.id, string(r.username), string(r.email))
+	fmt.Println("( ", r.id, string(r.username), string(r.email), " )")
 }
 
 type statement struct {
@@ -196,18 +294,18 @@ func (s *statement) execute(t *table) statusCode {
 
 func (s *statement) executeInsert(table *table) statusCode {
 	log("execute inser")
-	if table.num_rows >= s.rowToInsert.tableMaxRows {
+	if table.numOfRows >= s.rowToInsert.tableMaxRows {
 		return EXECUTE_TABLE_FULL
 	}
 	s.rowToInsert.serialize(table)
-	table.num_rows++
+	table.numOfRows++
 
 	return EXECUTE_SUCCESS
 }
 
 func (s *statement) executeSelect(table *table) statusCode {
 	var _row *row
-	for i := uint32(0); i < table.num_rows; i++ {
+	for i := uint32(0); i < table.numOfRows; i++ {
 		//deserializer row
 		_row = table.deserializeRow(i)
 		//print row
@@ -216,8 +314,9 @@ func (s *statement) executeSelect(table *table) statusCode {
 	return EXECUTE_SUCCESS
 }
 
-func doMetaCommand(input string) statusCode {
+func doMetaCommand(input string, t *table) statusCode {
 	if strings.Compare(input, ".exit") == 0 {
+		t.closeDB()
 		fmt.Println("Bye")
 		os.Exit(0)
 	}
@@ -227,7 +326,15 @@ func doMetaCommand(input string) statusCode {
 
 func main() {
 	fmt.Println("Hello World!!!")
-	table := NewTable()
+
+	if len(os.Args) < 2 {
+		fmt.Println("Invalid args")
+		os.Exit(1)
+	}
+
+	filename := os.Args[1]
+
+	table := openDB(filename)
 	for {
 		//print prompt
 		printPrompt()
@@ -235,7 +342,7 @@ func main() {
 		input := readLine()
 
 		if strings.Compare(input[:1], ".") == 0 {
-			switch doMetaCommand(input) {
+			switch doMetaCommand(input, table) {
 			case META_COMMAND_SUCCESS:
 				continue
 			case META_COMMAND_UNRECOGNIZED:
